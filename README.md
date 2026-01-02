@@ -22,4 +22,6 @@ Key flags:
 - `--exclude-dirs` skips path prefixes (e.g. `--exclude-dirs /blog /admin`).
 - `--timeout` sets the per-request timeout (seconds).
 
-The output groups each crawled page under its own heading and links back to the source URL.
+Output files:
+- Main content: `example.md` (one section per crawled page).
+- Crawl map: `example-crawlmap.md` (link tree with title + status message per URL).
