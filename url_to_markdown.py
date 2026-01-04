@@ -19,6 +19,9 @@ from langchain_community.document_loaders.recursive_url_loader import (
 from markdownify import markdownify
 
 
+MAX_SNAPSHOT_BYTES = 40 * 1024 * 1024  # 40 MB cap for generated snapshot files
+
+
 def html_to_markdown(html: str) -> str:
     """Convert raw HTML to Markdown while keeping headings/links readable."""
     return markdownify(html, heading_style="ATX")
@@ -54,8 +57,10 @@ def format_crawl_map(url: str, crawl_log: Iterable[CrawlLogEntry]) -> str:
     return "\n".join(header + lines)
 
 
-def format_markdown(url: str, documents: Iterable[Document]) -> str:
-    """Build a single Markdown string from the crawled documents."""
+def format_markdown_sections(
+    url: str, documents: Iterable[Document]
+) -> tuple[str, list[str]]:
+    """Build reusable Markdown sections (header + per-page blocks)."""
     docs = list(documents)
     header = [
         f"# Snapshot for {url}",
@@ -64,22 +69,60 @@ def format_markdown(url: str, documents: Iterable[Document]) -> str:
         "",
     ]
 
-    body: list[str] = []
+    page_sections: list[str] = []
     for index, doc in enumerate(docs, start=1):
         source = doc.metadata.get("source") or doc.metadata.get("url") or "Unknown source"
         title = doc.metadata.get("title")
         heading_text = title or source
-        body.append(f"## {index}. {heading_text}")
+        section_lines = [f"## {index}. {heading_text}"]
         if source and (not title or title != source):
-            body.append(f"[{source}]({source})")
-        body.append("")
+            section_lines.append(f"[{source}]({source})")
+        section_lines.append("")
         if doc.page_content:
-            body.append(doc.page_content.strip())
+            section_lines.append(doc.page_content.strip())
         else:
-            body.append("_No content extracted._")
-        body.append("")
+            section_lines.append("_No content extracted._")
+        section_lines.append("")
+        page_sections.append("\n".join(section_lines))
 
-    return "\n".join(header + body).rstrip() + "\n"
+    header_text = "\n".join(header).rstrip() + "\n"
+    return header_text, page_sections
+
+
+def format_markdown(url: str, documents: Iterable[Document]) -> str:
+    """Build a single Markdown string from the crawled documents."""
+    header_text, page_sections = format_markdown_sections(url, documents)
+    return header_text + "".join(page_sections)
+
+
+def chunk_markdown_sections(
+    header: str, pages: Sequence[str], *, max_bytes: int
+) -> list[str]:
+    """Split Markdown into file-sized parts without breaking pages."""
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+
+    parts: list[str] = []
+    current: list[str] = [header]
+    current_size = len(header.encode("utf-8"))
+
+    for index, page in enumerate(pages, start=1):
+        page_size = len(page.encode("utf-8"))
+        if page_size > max_bytes:
+            raise ValueError(
+                f"Page {index} is {page_size} bytes which exceeds the snapshot cap of {max_bytes} bytes. Pages are atomic and cannot be split."
+            )
+
+        if current_size + page_size > max_bytes:
+            parts.append("".join(current))
+            current = []
+            current_size = 0
+
+        current.append(page)
+        current_size += page_size
+
+    parts.append("".join(current))
+    return parts
 
 
 def default_output_path(url: str) -> Path:
@@ -253,13 +296,39 @@ def main(argv: list[str] | None = None) -> int:
         f"{output_path.stem}-crawlmap{output_path.suffix}"
     )
 
-    markdown = format_markdown(args.url, documents)
+    header_text, page_sections = format_markdown_sections(args.url, documents)
+    markdown_parts = chunk_markdown_sections(
+        header_text, page_sections, max_bytes=MAX_SNAPSHOT_BYTES
+    )
     crawl_map_markdown = format_crawl_map(args.url, crawl_log)
 
-    output_path.write_text(markdown, encoding="utf-8")
+    if len(markdown_parts) == 1:
+        snapshot_paths = [output_path]
+    else:
+        snapshot_paths = [
+            output_path.with_name(f"{output_path.stem}-{index}{output_path.suffix}")
+            for index in range(1, len(markdown_parts) + 1)
+        ]
+
+    for path, content in zip(snapshot_paths, markdown_parts):
+        path.write_text(content, encoding="utf-8")
+
     crawl_map_path.write_text(crawl_map_markdown, encoding="utf-8")
 
-    print(f"Wrote {len(documents)} page(s) to {output_path}")
+    if len(snapshot_paths) == 1:
+        print(
+            f"Wrote {len(documents)} page(s) to {snapshot_paths[0]} "
+            f"(max {MAX_SNAPSHOT_BYTES // (1024 * 1024)} MB per file)"
+        )
+    else:
+        print(
+            f"Wrote {len(documents)} page(s) across {len(snapshot_paths)} files "
+            f"(max {MAX_SNAPSHOT_BYTES // (1024 * 1024)} MB per file):"
+        )
+        for path in snapshot_paths:
+            size_mb = path.stat().st_size / (1024 * 1024)
+            print(f"  - {path} ({size_mb:.2f} MB)")
+
     print(f"Wrote crawl map to {crawl_map_path}")
     return 0
 
